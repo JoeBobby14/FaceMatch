@@ -3,6 +3,8 @@ import os
 import threading
 import numpy as np
 from pathlib import Path
+from datetime import datetime
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 dataset_dir = os.path.join(BASE_DIR, "dataset")
@@ -18,28 +20,26 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 def extract_face_features_robust(face_roi):
     """
     Extract multi-scale features from face for angle-invariant matching
-    Combines histogram, edge detection, and gradient information
+    Uses template matching and histogram comparison
     """
+    # Resize to standard size for better comparison
+    face_roi = cv2.resize(face_roi, (100, 100))
     gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
     
-    # Feature 1: Brightness histogram (lighting patterns)
+    # Feature 1: Face template (down-scaled for speed)
+    template = cv2.resize(gray, (50, 50)).flatten()
+    
+    # Feature 2: Brightness histogram
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
     hist = cv2.normalize(hist, hist).flatten()
     
-    # Feature 2: Edge histogram (facial structure - angle invariant)
-    edges = cv2.Canny(gray, 100, 200)
+    # Feature 3: Edge detection
+    edges = cv2.Canny(gray, 50, 150)
     edge_hist = cv2.calcHist([edges], [0], None, [256], [0, 256])
     edge_hist = cv2.normalize(edge_hist, edge_hist).flatten()
     
-    # Feature 3: Gradient magnitude (contours - pose invariant)
-    sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=5)
-    sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=5)
-    mag = np.uint8(np.sqrt(sobelx**2 + sobely**2) / np.sqrt(2))
-    grad_hist = cv2.calcHist([mag], [0], None, [256], [0, 256])
-    grad_hist = cv2.normalize(grad_hist, grad_hist).flatten()
-    
-    # Combine all features (768 total values)
-    combined = np.concatenate([hist, edge_hist, grad_hist])
+    # Combine features
+    combined = np.concatenate([template, hist, edge_hist])
     return combined
 
 def load_reference_images():
@@ -51,8 +51,11 @@ def load_reference_images():
             for img_name in os.listdir(person_dir):
                 if img_name.endswith(('.jpg', '.png', '.jpeg')):
                     img_path = os.path.join(person_dir, img_name)
-                    img = cv2.imread(img_path)
-                    if img is not None:
+                    try:
+                        img = cv2.imread(img_path)
+                        if img is None:
+                            print(f"  Warning: Could not read {img_name}")
+                            continue
                         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                         faces = face_cascade.detectMultiScale(gray, 1.3, 5, minSize=(50, 50))
                         if len(faces) > 0:
@@ -62,34 +65,44 @@ def load_reference_images():
                             if person_name not in reference_data:
                                 reference_data[person_name] = []
                             reference_data[person_name].append(features)
+                    except Exception as e:
+                        print(f"  Error processing {img_name}: {e}")
     return reference_data
 
-def match_face(current_features, reference_data, threshold=0.45):
+def match_face(current_features, reference_data, threshold=8.0):
     """
-    Find closest match using multi-feature comparison
-    Uses Chi-Square distance for histogram-like features
+    Find closest match using multiple comparison methods
+    Uses Euclidean distance for more reliable matching
+    Returns: (person_name, confidence_score)
     """
     if current_features is None:
-        return "Unknown"
+        return "Unknown", 0.0
     
     best_match = "Unknown"
     best_distance = float('inf')
+    match_distances = {}
     
     for person_name, feature_list in reference_data.items():
+        person_distances = []
         for ref_features in feature_list:
-            # Use Chi-Square distance (good for histogram comparison)
-            distance = cv2.compareHist(
-                current_features.reshape(-1, 1), 
-                ref_features.reshape(-1, 1),
-                cv2.HISTCMP_CHISQR
-            )
-            if distance < best_distance:
-                best_distance = distance
-                best_match = person_name
+            # Use Euclidean distance (L2 norm)
+            distance = np.linalg.norm(current_features - ref_features)
+            person_distances.append(distance)
+        
+        # Use average distance across all reference images for this person
+        avg_distance = np.mean(person_distances)
+        match_distances[person_name] = avg_distance
+        
+        if avg_distance < best_distance:
+            best_distance = avg_distance
+            best_match = person_name
+    
+    # Calculate confidence score (inverse of distance, normalized)
+    confidence = max(0, 100 - (best_distance * 10)) if best_distance < 10 else 0
     
     if best_distance > threshold:
-        return "Unknown"
-    return best_match
+        return "Unknown", 0.0
+    return best_match, confidence
 
 print("Loading reference images with robust multi-feature matching...")
 reference_data = load_reference_images()
@@ -100,7 +113,9 @@ if not reference_data:
     )
 total_refs = sum(len(v) for v in reference_data.values())
 print(f"✓ Loaded {total_refs} reference faces from {len(reference_data)} people")
-print("✓ Using angle-invariant multi-feature matching")
+for person_name, features in reference_data.items():
+    print(f"  - {person_name}: {len(features)} image(s)")
+print("✓ Using Euclidean distance matching with template comparison")
 print("✓ Works at any angle or expression!\n")
 
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -110,16 +125,40 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 counter = 0
 face_match = False
 matched_name = "Unknown"
+matched_confidence = 0.0
+last_recognized = None
+last_recognized_time = None
+recognition_count = 0
 
 def check_face(face_roi):
-    global face_match, matched_name
-    features = extract_face_features_robust(face_roi)
-    matched = match_face(features, reference_data, threshold=0.45)
-    face_match = (matched != "Unknown")
-    matched_name = matched
+    global face_match, matched_name, matched_confidence, last_recognized, last_recognized_time, recognition_count
+    try:
+        features = extract_face_features_robust(face_roi)
+        matched, confidence = match_face(features, reference_data, threshold=8.0)
+        face_match = (matched != "Unknown")
+        matched_name = matched
+        matched_confidence = confidence
+        
+        # Log recognition
+        if face_match and (last_recognized != matched_name or (last_recognized_time and time.time() - last_recognized_time > 5)):
+            recognition_count += 1
+            last_recognized = matched_name
+            last_recognized_time = time.time()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n{'='*50}")
+            print(f"✅ RECOGNIZED #{recognition_count}: {matched_name}")
+            print(f"   Confidence: {confidence:.1f}%")
+            print(f"   Time: {timestamp}")
+            print(f"{'='*50}\n")
+    except Exception as e:
+        print(f"Error in face matching: {e}")
+        face_match = False
+        matched_name = "Unknown"
+        matched_confidence = 0.0
 
 print("🎥 Starting face recognition... Press 'q' to quit")
-print("=" * 50 + "\n")
+print("=" * 50)
+print(f"Registered people: {', '.join(reference_data.keys())}\n")
 
 while True:
     ret, frame = cap.read()
@@ -136,8 +175,8 @@ while True:
             # Draw face rectangle
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
-            # Extract features every 15 frames
-            if counter % 15 == 0:
+            # Extract features every 5 frames for faster matching
+            if counter % 5 == 0:
                 face_roi = frame[y:y+h, x:x+w]
                 try:
                     threading.Thread(target=check_face, args=(face_roi,), daemon=True).start()
@@ -148,13 +187,22 @@ while True:
 
         # Display match result
         if face_match and matched_name != "Unknown":
-            cv2.rectangle(frame, (10, 10), (500, 60), (0, 255, 0), 3)
-            cv2.putText(frame, f"MATCH: {matched_name}", (20, 45), 
+            cv2.rectangle(frame, (10, 10), (600, 80), (0, 255, 0), 3)
+            cv2.putText(frame, f"✅ MATCH: {matched_name}", (20, 45), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            cv2.putText(frame, f"Confidence: {matched_confidence:.1f}%", (20, 75),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:
-            cv2.rectangle(frame, (10, 10), (300, 60), (0, 0, 255), 3)
-            cv2.putText(frame, "No Match", (20, 45), 
+            cv2.rectangle(frame, (10, 10), (300, 80), (0, 0, 255), 3)
+            cv2.putText(frame, "Analyzing...", (20, 45), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            cv2.putText(frame, "No match yet", (20, 75),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Show registered people
+        people_text = "Registered: " + ", ".join(reference_data.keys())
+        cv2.putText(frame, people_text, (10, frame.shape[0] - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         cv2.imshow("🔍 Real-Time Face Recognition", frame)
 

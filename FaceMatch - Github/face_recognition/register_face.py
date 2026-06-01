@@ -15,6 +15,20 @@ def register_face():
     print("🔒 FACE REGISTRATION SYSTEM")
     print("=" * 60)
     
+    # Verify dataset directory exists and is writable
+    try:
+        os.makedirs(dataset_dir, exist_ok=True)
+        # Test write permission
+        test_file = os.path.join(dataset_dir, ".write_test")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        os.remove(test_file)
+        print(f"✓ Dataset directory: {dataset_dir}")
+    except Exception as e:
+        print(f"❌ Cannot write to dataset directory: {dataset_dir}")
+        print(f"Error: {e}")
+        return False
+    
     # Get user name
     person_name = input("\n📝 Enter your name: ").strip()
     
@@ -24,7 +38,11 @@ def register_face():
     
     # Create directory for this person
     person_dir = os.path.join(dataset_dir, person_name)
-    os.makedirs(person_dir, exist_ok=True)
+    try:
+        os.makedirs(person_dir, exist_ok=True)
+    except Exception as e:
+        print(f"❌ Cannot create directory for {person_name}: {e}")
+        return False
     
     # Check if person already exists
     existing_images = len([f for f in os.listdir(person_dir) if f.endswith(('.jpg', '.png', '.jpeg'))])
@@ -92,15 +110,27 @@ def register_face():
         
         cv2.imshow("🔒 Face Registration", frame)
         
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(30) & 0xFF
         
-        if key == ord(' ') and face_detected:  # SPACE to capture
+        if key == 32 and face_detected:  # SPACE key (ASCII 32) to capture
             image_count += 1
             captured_count += 1
             filename = f"{person_name}_{image_count:03d}.jpg"
             filepath = os.path.join(person_dir, filename)
-            cv2.imwrite(filepath, frame)
-            print(f"  ✓ Image {captured_count}/{target_images} captured: {filename}")
+            try:
+                # Ensure directory exists
+                os.makedirs(person_dir, exist_ok=True)
+                success = cv2.imwrite(filepath, frame)
+                if success:
+                    print(f"  ✓ Image {captured_count}/{target_images} captured: {filename}")
+                else:
+                    print(f"  ❌ Failed to save image {captured_count}/{target_images}: {filename}")
+                    captured_count -= 1
+                    image_count -= 1
+            except Exception as e:
+                print(f"  ❌ Error saving image: {e}")
+                captured_count -= 1
+                image_count -= 1
             frames_since_last_capture = 0
         elif key == ord('q'):  # Q to quit
             break
